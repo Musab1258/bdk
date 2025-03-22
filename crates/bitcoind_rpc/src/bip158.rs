@@ -172,26 +172,55 @@ impl<C: RpcApi> Iterator for FilterIter<'_, C> {
 
     fn next(&mut self) -> Option<Self::Item> {
         (|| -> Result<_, Error> {
-            // if the next filter matches any of our watched spks, get the block
-            // and return it, inserting relevant block ids along the way
-            self.next_filter()?.map_or(Ok(None), |(block, filter)| {
-                let height = block.height;
-                let hash = block.hash;
+            loop {
+                let next_filter = self.next_filter()?;
+                if let Some((block, filter)) = next_filter {
+                    let height = block.height;
+                    let hash = block.hash;
 
-                if self.spks.is_empty() {
-                    Err(Error::NoScripts)
-                } else if filter
-                    .match_any(&hash, self.spks.iter().map(|script| script.as_bytes()))
-                    .map_err(Error::Bip158)?
-                {
-                    let block = self.client.get_block(&hash)?;
-                    self.blocks.insert(height, hash);
-                    let inner = EventInner { height, block };
-                    Ok(Some(Event::Block(inner)))
+                    // Check continuity with previous block
+                    if height > 0 {
+                        let prev_height = height - 1;
+
+                        let prev_hash = match self.blocks.get(&prev_height).copied() {
+                            Some(hash) => hash,
+                            None => self.client.get_block_hash(prev_height as u64)?,
+                        };
+
+                        let current_header = self.client.get_block_header_info(&hash)?;
+                        if current_header.previous_block_hash != Some(prev_hash) {
+                            // Reorg detected: find fork point
+                            let fork_height = self.find_fork_point(height)?;
+
+                            // Reset to fork height + 1 and clear invalid blocks
+                            self.height = fork_height + 1;
+                            self.blocks.retain(|h, _| *h <= fork_height);
+
+                            // Re-fetch the tip to update block cache
+                            self.get_tip()?;
+                            continue;
+                        }
+                    }
+
+                    if self.spks.is_empty() {
+                        return Err(Error::NoScripts);
+                    }
+
+                    let matches = filter
+                        .match_any(&hash, self.spks.iter().map(|s| s.as_bytes()))
+                        .map_err(Error::Bip158)?;
+
+                    if matches {
+                        let block = self.client.get_block(&hash)?;
+                        self.blocks.insert(height, hash);
+                        return Ok(Some(Event::Block(EventInner { height, block })));
+                    } else {
+                        return Ok(Some(Event::NoMatch(height)));
+                    }
                 } else {
-                    Ok(Some(Event::NoMatch(height)))
+                    return Ok(None);
                 }
-            })
+            }
         })()
         .transpose()
     }
@@ -216,6 +245,26 @@ impl<C: RpcApi> FilterIter<'_, C> {
             self.blocks.insert(height, fetched_hash);
             cp = cp.prev().expect("must break before genesis");
         }
+    }
+
+    /// Find the fork point by checking previous blocks
+    fn find_fork_point(&self, mut height: u32) -> Result<u32, Error> {
+        let lookback_depth = 10; // Adjust based on security needs
+        let min_height = height.saturating_sub(lookback_depth);
+
+        while height > min_height {
+            height -= 1;
+            let current_hash = self.client.get_block_hash(height as u64)?;
+            let current_header = self.client.get_block_header_info(&current_hash)?;
+
+            if height == 0
+                || current_header.previous_block_hash
+                    == Some(self.client.get_block_hash((height - 1) as u64)?)
+            {
+                return Ok(height);
+            }
+        }
+        Ok(0) // Fallback to genesis
     }
 
     /// Returns a chain update from the newly scanned blocks.
