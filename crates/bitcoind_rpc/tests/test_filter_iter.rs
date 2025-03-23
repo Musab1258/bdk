@@ -1,6 +1,6 @@
 use bitcoin::{constants, Address, Amount, Network, ScriptBuf};
 
-use bdk_bitcoind_rpc::bip158::FilterIter;
+use bdk_bitcoind_rpc::bip158::{Event, FilterIter};
 use bdk_core::{BlockId, CheckPoint};
 use bdk_testenv::{anyhow, bitcoind, block_id, TestEnv};
 use bitcoincore_rpc::RpcApi;
@@ -160,6 +160,53 @@ fn filter_iter_error_no_scripts() -> anyhow::Result<()> {
         assert!(matches!(iter.next().unwrap(), Err(Error::NoScripts)));
     }
     assert!(iter.next().is_none());
+
+    Ok(())
+}
+
+#[test]
+fn test_reorg_handling() -> anyhow::Result<()> {
+    let env = testenv()?;
+    let rpc = env.rpc_client();
+
+    // Mine initial chain: 100:A, 101:B
+    let block_a_hash = env.mine_blocks(1, None)?[0];
+    let block_b_hash = env.mine_blocks(1, None)?[0];
+
+    let mut iter = FilterIter::new_with_height(rpc, 100);
+    iter.add_spks(vec![ScriptBuf::new()]); // Dummy SPK
+
+    // Process block 100:A
+    assert!(matches!(
+        iter.next().transpose()?,
+        Some(Event::NoMatch(100))
+    ));
+
+    // Reorg to 100:A', 101:B'
+    // 1. Invalidate existing blocks
+    rpc.invalidate_block(&block_a_hash)?;
+    rpc.invalidate_block(&block_b_hash)?;
+
+    // 2. Mine new chain starting from parent of block_a
+    let block_a_prime = env.mine_blocks(1, None)?[0]; // Builds on new tip
+    let block_b_prime = env.mine_blocks(1, None)?[0];
+
+    // Process new blocks
+    match iter.next().transpose()? {
+        Some(Event::Block(inner)) => {
+            assert_eq!(inner.height, 100);
+            assert_eq!(inner.block.block_hash(), block_a_prime);
+        }
+        _ => panic!("Expected block 100:A'"),
+    }
+
+    match iter.next().transpose()? {
+        Some(Event::Block(inner)) => {
+            assert_eq!(inner.height, 101);
+            assert_eq!(inner.block.block_hash(), block_b_prime);
+        }
+        _ => panic!("Expected block 101:B'"),
+    }
 
     Ok(())
 }
