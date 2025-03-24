@@ -169,12 +169,20 @@ fn test_reorg_handling() -> anyhow::Result<()> {
     let env = testenv()?;
     let rpc = env.rpc_client();
 
+    // Make sure we have a chain with sufficient height
+    while rpc.get_block_count()? < 99 {
+        env.mine_blocks(1, None)?;
+    }
+
     // Mine initial chain: 100:A, 101:B
     let block_a_hash = env.mine_blocks(1, None)?[0];
     let block_b_hash = env.mine_blocks(1, None)?[0];
 
+    // Create SPK to test with
+    let dummy_spk = ScriptBuf::new();
+
     let mut iter = FilterIter::new_with_height(rpc, 100);
-    iter.add_spks(vec![ScriptBuf::new()]); // Dummy SPK
+    iter.add_spks(vec![dummy_spk.clone()]);
 
     // Process block 100:A
     assert!(matches!(
@@ -185,27 +193,38 @@ fn test_reorg_handling() -> anyhow::Result<()> {
     // Reorg to 100:A', 101:B'
     // 1. Invalidate existing blocks
     rpc.invalidate_block(&block_a_hash)?;
-    rpc.invalidate_block(&block_b_hash)?;
 
-    // 2. Mine new chain starting from parent of block_a
-    let block_a_prime = env.mine_blocks(1, None)?[0]; // Builds on new tip
+    // 2. Mine new chain with transaction matching our SPK
+    // Create a transaction that matches our dummy SPK for block A'
+    let address = Address::from_script(&dummy_spk, Network::Regtest)?;
+    rpc.send_to_address(
+        &address,
+        Amount::from_sat(1000),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+
+    // Mine new blocks
+    let block_a_prime = env.mine_blocks(1, None)?[0];
     let block_b_prime = env.mine_blocks(1, None)?[0];
 
-    // Process new blocks
+    // Process new blocks - should detect reorg and match the transaction
     match iter.next().transpose()? {
         Some(Event::Block(inner)) => {
             assert_eq!(inner.height, 100);
             assert_eq!(inner.block.block_hash(), block_a_prime);
         }
-        _ => panic!("Expected block 100:A'"),
+        other => panic!("Expected block 100:A', got {:?}", other),
     }
 
+    // The second block should be a NoMatch since we don't have a matching transaction
     match iter.next().transpose()? {
-        Some(Event::Block(inner)) => {
-            assert_eq!(inner.height, 101);
-            assert_eq!(inner.block.block_hash(), block_b_prime);
-        }
-        _ => panic!("Expected block 101:B'"),
+        Some(Event::NoMatch(101)) => { /* Expected */ }
+        other => panic!("Expected NoMatch(101), got {:?}", other),
     }
 
     Ok(())
