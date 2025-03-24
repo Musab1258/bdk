@@ -178,10 +178,12 @@ impl<C: RpcApi> Iterator for FilterIter<'_, C> {
                     let height = block.height;
                     let hash = block.hash;
 
-                    // Check continuity with previous block
-                    if height > 0 {
+                    // Check continuity with previous block for recent blocks
+                    // Only check blocks within the last 100 blocks as deep reorgs are extremely rare
+                    if height > 0 && height > self.height.saturating_sub(100) {
                         let prev_height = height - 1;
 
+                        // Use cached block if available, otherwise fetch
                         let prev_hash = match self.blocks.get(&prev_height).copied() {
                             Some(hash) => hash,
                             None => self.client.get_block_hash(prev_height as u64)?,
@@ -204,16 +206,14 @@ impl<C: RpcApi> Iterator for FilterIter<'_, C> {
 
                     if self.spks.is_empty() {
                         return Err(Error::NoScripts);
-                    }
-
-                    let matches = filter
-                        .match_any(&hash, self.spks.iter().map(|s| s.as_bytes()))
-                        .map_err(Error::Bip158)?;
-
-                    if matches {
+                    } else if filter
+                        .match_any(&hash, self.spks.iter().map(|script| script.as_bytes()))
+                        .map_err(Error::Bip158)?
+                    {
                         let block = self.client.get_block(&hash)?;
                         self.blocks.insert(height, hash);
-                        return Ok(Some(Event::Block(EventInner { height, block })));
+                        let inner = EventInner { height, block };
+                        return Ok(Some(Event::Block(inner)));
                     } else {
                         return Ok(Some(Event::NoMatch(height)));
                     }
@@ -247,24 +247,61 @@ impl<C: RpcApi> FilterIter<'_, C> {
         }
     }
 
-    /// Find the fork point by checking previous blocks
-    fn find_fork_point(&self, mut height: u32) -> Result<u32, Error> {
-        let lookback_depth = 10; // Adjust based on security needs
-        let min_height = height.saturating_sub(lookback_depth);
+    fn find_fork_point(&self, current_height: u32) -> Result<u32, Error> {
+        // Try a quick check of the immediate previous block first (common case)
+        if current_height > 0 {
+            let prev_height = current_height - 1;
+            let prev_hash = self.client.get_block_hash(prev_height as u64)?;
+            let prev_header = self.client.get_block_header_info(&prev_hash)?;
 
-        while height > min_height {
-            height -= 1;
-            let current_hash = self.client.get_block_hash(height as u64)?;
-            let current_header = self.client.get_block_header_info(&current_hash)?;
-
-            if height == 0
-                || current_header.previous_block_hash
-                    == Some(self.client.get_block_hash((height - 1) as u64)?)
+            // If previous block links properly to its parent, it's valid
+            if prev_height == 0
+                || prev_header.previous_block_hash.is_some()
+                    && prev_header.previous_block_hash
+                        == Some(self.client.get_block_hash((prev_height - 1) as u64)?)
             {
-                return Ok(height);
+                return Ok(prev_height);
             }
         }
-        Ok(0) // Fallback to genesis
+
+        // Binary search for fork point
+        let max_lookback = 10; // Adjust based on security needs
+        let min_height = current_height.saturating_sub(max_lookback);
+
+        let mut low = min_height;
+        let mut high = current_height.saturating_sub(1);
+
+        while low <= high {
+            let mid = low + (high - low) / 2;
+
+            // Check if this block is valid in the chain
+            let hash = self.client.get_block_hash(mid as u64)?;
+            let header = self.client.get_block_header_info(&hash)?;
+
+            let is_valid = if mid == 0 {
+                true // Genesis is always valid
+            } else {
+                let prev_hash = self.client.get_block_hash((mid - 1) as u64)?;
+                header.previous_block_hash == Some(prev_hash)
+            };
+
+            if is_valid {
+                // Check if the next block is invalid, which would make this our fork point
+                if mid == high || {
+                    let next_hash = self.client.get_block_hash((mid + 1) as u64)?;
+                    let next_header = self.client.get_block_header_info(&next_hash)?;
+                    next_header.previous_block_hash != Some(hash)
+                } {
+                    return Ok(mid);
+                }
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+
+        // Fall back to lowest valid block or genesis
+        Ok(low.saturating_sub(1))
     }
 
     /// Returns a chain update from the newly scanned blocks.
