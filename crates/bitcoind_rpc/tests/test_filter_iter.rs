@@ -176,7 +176,7 @@ fn test_reorg_handling() -> anyhow::Result<()> {
 
     // Mine initial chain: 100:A, 101:B
     let block_a_hash = env.mine_blocks(1, None)?[0];
-    let block_b_hash = env.mine_blocks(1, None)?[0];
+    let _block_b_hash = env.mine_blocks(1, None)?[0];
 
     // Create SPK to test with
     let dummy_spk = ScriptBuf::new();
@@ -210,7 +210,7 @@ fn test_reorg_handling() -> anyhow::Result<()> {
 
     // Mine new blocks
     let block_a_prime = env.mine_blocks(1, None)?[0];
-    let block_b_prime = env.mine_blocks(1, None)?[0];
+    let _block_b_prime = env.mine_blocks(1, None)?[0];
 
     // Process new blocks - should detect reorg and match the transaction
     match iter.next().transpose()? {
