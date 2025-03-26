@@ -3,6 +3,7 @@ use bitcoin::{constants, Address, Amount, Network, ScriptBuf};
 use bdk_bitcoind_rpc::bip158::{Event, FilterIter};
 use bdk_core::{BlockId, CheckPoint};
 use bdk_testenv::{anyhow, bitcoind, block_id, TestEnv};
+use bitcoin::secp256k1::rand;
 use bitcoincore_rpc::RpcApi;
 
 fn testenv() -> anyhow::Result<TestEnv> {
@@ -169,34 +170,44 @@ fn test_reorg_handling() -> anyhow::Result<()> {
     let env = testenv()?;
     let rpc = env.rpc_client();
 
-    // Make sure we have a chain with sufficient height
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+
+    // Generate compressed key pair
+    let (sk, _) = secp.generate_keypair(&mut rand::thread_rng());
+    let secp_pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+    let pubkey = bitcoin::PublicKey::new(secp_pubkey);
+
+    // Get wpkh (will be compressed since from_secret_key creates compressed keys)
+    let wpkh = pubkey
+        .wpubkey_hash()
+        .expect("Public key should be compressed for wpkh");
+
+    let spk = ScriptBuf::new_p2wpkh(&wpkh);
+
+    // Mine initial chain up to height 99
     while rpc.get_block_count()? < 99 {
         env.mine_blocks(1, None)?;
     }
 
-    // Mine initial chain: 100:A, 101:B
+    // Mine initial blocks 100:A, 101:B
     let block_a_hash = env.mine_blocks(1, None)?[0];
     let _block_b_hash = env.mine_blocks(1, None)?[0];
 
-    // Create SPK to test with
-    let dummy_spk = ScriptBuf::new();
-
+    // Create FilterIter starting at height 100
     let mut iter = FilterIter::new_with_height(rpc, 100);
-    iter.add_spks(vec![dummy_spk.clone()]);
+    iter.add_spk(spk.clone());
 
-    // Process block 100:A
+    // Process block 100:A (NoMatch)
     assert!(matches!(
         iter.next().transpose()?,
         Some(Event::NoMatch(100))
     ));
 
-    // Reorg to 100:A', 101:B'
-    // 1. Invalidate existing blocks
+    // Reorg: Invalidate A, mine new chain A'->B' with a matching transaction
     rpc.invalidate_block(&block_a_hash)?;
 
-    // 2. Mine new chain with transaction matching our SPK
-    // Create a transaction that matches our dummy SPK for block A'
-    let address = Address::from_script(&dummy_spk, Network::Regtest)?;
+    // Create transaction matching our SPK
+    let address = Address::from_script(&spk, Network::Regtest)?;
     rpc.send_to_address(
         &address,
         Amount::from_sat(1000),
@@ -208,24 +219,27 @@ fn test_reorg_handling() -> anyhow::Result<()> {
         None,
     )?;
 
-    // Mine new blocks
+    // Mine new blocks 100:A', 101:B'
     let block_a_prime = env.mine_blocks(1, None)?[0];
     let _block_b_prime = env.mine_blocks(1, None)?[0];
 
-    // Process new blocks - should detect reorg and match the transaction
+    // Process reorged blocks
     match iter.next().transpose()? {
         Some(Event::Block(inner)) => {
             assert_eq!(inner.height, 100);
             assert_eq!(inner.block.block_hash(), block_a_prime);
+            // Verify transaction exists
+            assert!(inner
+                .block
+                .txdata
+                .iter()
+                .any(|tx| tx.output.iter().any(|o| o.script_pubkey == spk)));
         }
-        other => panic!("Expected block 100:A', got {:?}", other),
+        other => panic!("Expected Block(100), got {:?}", other),
     }
 
-    // The second block should be a NoMatch since we don't have a matching transaction
     match iter.next().transpose()? {
-        Some(Event::NoMatch(101)) => { /* Expected */ }
+        Some(Event::NoMatch(101)) => Ok(()),
         other => panic!("Expected NoMatch(101), got {:?}", other),
     }
-
-    Ok(())
 }

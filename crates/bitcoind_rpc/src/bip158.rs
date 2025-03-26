@@ -178,32 +178,31 @@ impl<C: RpcApi> Iterator for FilterIter<'_, C> {
                     let height = block.height;
                     let hash = block.hash;
 
-                    // Check continuity with previous block for recent blocks
-                    // Only check blocks within the last 100 blocks as deep reorgs are extremely rare
-                    if height > 0 && height > self.height.saturating_sub(100) {
+                    // Enhanced reorg detection logic
+                    if height > 0 {
                         let prev_height = height - 1;
 
-                        // Use cached block if available, otherwise fetch
+                        // Get previous block hash from cache or node
                         let prev_hash = match self.blocks.get(&prev_height).copied() {
                             Some(hash) => hash,
                             None => self.client.get_block_hash(prev_height as u64)?,
                         };
 
+                        // Verify chain continuity
                         let current_header = self.client.get_block_header_info(&hash)?;
                         if current_header.previous_block_hash != Some(prev_hash) {
                             // Reorg detected: find fork point
-                            let fork_height = self.find_fork_point(height)?;
+                            let fork_height = self.find_fork_point(prev_height)?;
 
-                            // Reset to fork height + 1 and clear invalid blocks
-                            self.height = fork_height + 1;
+                            // Reset state to fork height
+                            self.height = fork_height;
                             self.blocks.retain(|h, _| *h <= fork_height);
 
-                            // Re-fetch the tip to update block cache
-                            self.get_tip()?;
-                            continue;
+                            continue; // Restart processing from fork height
                         }
                     }
 
+                    // Existing filter matching logic
                     if self.spks.is_empty() {
                         return Err(Error::NoScripts);
                     } else if filter
